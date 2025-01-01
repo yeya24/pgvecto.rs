@@ -1,157 +1,189 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  schedule:
-    # 00:00 UTC+8 -> 16:00
-    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       version:
         type: string
-        description: The version to be released.
+        description: Version
         required: true
-      ref:
+      tag:
         type: string
-        description: |
-          Ref to checkout.
-          For tags, use the prefix "refs/tags/".
-          For branchs, use the prefix "refs/heads/".
+        description: Tag
         required: true
-        default: refs/heads/main
-      prerelease:
-        type: boolean
-        description: Prerelease or not.
-        required: true
-        default: true
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: "-Dwarnings"
 
 permissions:
   contents: write
   pull-requests: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  setup:
-    runs-on: ubuntu-20.04
+  semver:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Check recents
-        id: check-recents
-        run: |
-          commit_date=$(git log -1 --since="24 hours ago" --pretty=format:"%cI")
-          if [[ -n "$commit_date" ]];
-          then echo "recents=true" >> $GITHUB_OUTPUT;
-          else echo "recents=false" >> $GITHUB_OUTPUT;
-          fi
-        shell: bash
-      - name: Set version, recheck, ref, prerelease
-        id: sets
-        uses: actions/github-script@v6
+      - uses: actions/github-script@v7
         with:
           script: |
-            if ("${{ github.event_name }}" == 'push') {
-              if (context.ref.startsWith("refs/tags/")) {
-                let version = context.ref.substring("refs/tags/".length);
-                core.setOutput('version', version);
-                core.setOutput('recheck', 'true');
-                core.setOutput('ref', context.ref);
-                core.setOutput('prerelease', false);
-              } else {
-                throw new Error("unreachable");
-              }
-            } else if ("${{ github.event_name }}" == 'schedule') {
-              let date = new Date();
-              date.setHours(date.getHours() + 8);
-              var yyyy = date.getUTCFullYear();
-              var mm = String(1 + date.getUTCMonth()).padStart(2, '0');
-              var dd = String(0 + date.getUTCDate()).padStart(2, '0');
-              let version = `v0.0.0-nightly.${yyyy}${mm}${dd}`;
-              core.setOutput('version', version);
-              if ("${{ steps.check-recents.outputs.recents }}" == "true") {
-                core.setOutput('recheck', 'true');
-              } else {
-                core.setOutput('recheck', 'false');
-              }
-              core.setOutput('ref', 'refs/heads/main');
-              core.setOutput('prerelease', true);
-            } else if ("${{ github.event_name }}" == 'workflow_dispatch') {
-              let version = "${{ github.event.inputs.version }}";
-              let ref = "${{ github.event.inputs.ref }}";
-              let prerelease = "${{ github.event.inputs.prerelease }}";
-              core.setOutput('version', version);
-              core.setOutput('recheck', 'true');
-              core.setOutput('ref', ref);
-              core.setOutput('prerelease', prerelease);
-            } else {
-              throw new Error("unreachable");
+            const r = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+            if (!r.test("${{ github.event.inputs.version }}")) {
+              core.setFailed(`Action failed with an invalid semver.`);
             }
-    outputs:
-      version: ${{ steps.sets.outputs.version }}
-      recheck: ${{ steps.sets.outputs.recheck }}
-      ref: ${{ steps.sets.outputs.ref }}
-      prerelease: ${{ steps.sets.outputs.prerelease }}
-  release:
+  binary:
     strategy:
       matrix:
-        version: [15]
-    needs: setup
+        version: [14, 15, 16, 17]
+        arch: ["x86_64", "aarch64"]
     runs-on: ubuntu-20.04
-    if: ${{ needs.setup.outputs.recheck == 'true' }}
+    env:
+      SEMVER: ${{ github.event.inputs.version }}
+      VERSION: ${{ matrix.version }}
+      ARCH: ${{ matrix.arch }}
+    needs: ["semver"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ needs.setup.outputs.ref }}
-      - name: Prepare
+        uses: actions/checkout@v4
+      - name: Set up Environment
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get remove -y '^postgres.*' '^libpq.*' '^clang.*' '^llvm.*' '^libclang.*' '^libllvm.*' '^mono-llvm.*'
+          sudo apt-get purge -y '^postgres.*' '^libpq.*' '^clang.*' '^llvm.*' '^libclang.*' '^libllvm.*' '^mono-llvm.*'
           sudo apt-get update
-          sudo apt-get -y install libpq-dev postgresql-${{ matrix.version }} postgresql-server-dev-${{ matrix.version }}
-          cargo install cargo-pgrx --git https://github.com/tensorchord/pgrx.git --rev $(cat Cargo.toml | grep "pgrx =" | awk -F'rev = "' '{print $2}' | cut -d'"' -f1)
-          cargo pgrx init --pg${{ matrix.version }}=/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
-      - name: Build Release
-        id: build_release
+          sudo apt-get install -y build-essential crossbuild-essential-arm64
+          sudo apt-get install -y qemu-user-static
+          touch ~/.cargo/config.toml
+          echo 'target.aarch64-unknown-linux-gnu.linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+          echo 'target.aarch64-unknown-linux-gnu.runner = ["qemu-aarch64-static", "-L", "/usr/aarch64-linux-gnu"]' >> ~/.cargo/config.toml
+          rustup target add x86_64-unknown-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+      - name: Set up Sccache
+        uses: mozilla-actions/sccache-action@v0.0.4
+      - name: Set up Cache
+        uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ github.job }}-${{ hashFiles('./Cargo.lock') }}-${{ matrix.version }}-${{ matrix.arch }}
+      - name: Build
         run: |
-          sudo apt-get install ruby-dev libarchive-tools
-          sudo gem install --no-document fpm
-          cargo pgrx package
-          mkdir ./artifacts
-          mv ./target/release/vectors-pg${{ matrix.version }}/usr ./artifacts/usr
-          cd artifacts
-          fpm \
-            --input-type dir \
-            --output-type deb \
-            --name vectors-pg${{ matrix.version }} \
-            --version ${{ needs.setup.outputs.version }} \
-            --license apache2 \
-            --deb-no-default-config-files \
-            --package ../vectors-pg${{ matrix.version }}-${{ needs.setup.outputs.version }}-amd64-unknown-linux-gnu.deb \
-            --architecture amd64 \
-            .
-          cd ..
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+          export PGRX_PG_CONFIG_PATH=$(pwd)/vendor/pg${VERSION}_${ARCH}_debian/pg_config/pg_config
+          export PGRX_TARGET_INFO_PATH_PG$VERSION=$(pwd)/vendor/pg${VERSION}_${ARCH}_debian/pgrx_binding
+          cargo build --package pgvectors --lib --features pg$VERSION --target $ARCH-unknown-linux-gnu --release
+          ./tools/schema.sh --features pg$VERSION --target $ARCH-unknown-linux-gnu --release | expand -t 4 > ./target/schema.sql
+      - name: Package
+        run: |
+          export PLATFORM=$(echo $ARCH | sed 's/aarch64/arm64/; s/x86_64/amd64/')
+          ./scripts/package.sh
+      - name: Upload
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export TAG=${{ github.event.inputs.tag }}
+          export PLATFORM=$(echo $ARCH | sed 's/aarch64/arm64/; s/x86_64/amd64/')
+          gh release upload --clobber $TAG ./build/vectors-pg${VERSION}_${ARCH}-unknown-linux-gnu_${SEMVER}.zip
+          gh release upload --clobber $TAG ./build/vectors-pg${VERSION}_${SEMVER}_${PLATFORM}.deb
+      - name: Post Set up Cache
+        uses: actions/cache/save@v4
+        if: ${{ !steps.cache.outputs.cache-hit }}
         with:
-          tag_name: ${{ needs.setup.outputs.version }}
-          release_name: ${{ needs.setup.outputs.version }}
-          draft: false
-          prerelease: ${{ needs.setup.outputs.prerelease }}
-      - name: Upload Release / DEB
-        id: upload_release_deb
-        uses: actions/upload-release-asset@v1
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ github.job }}-${{ hashFiles('./Cargo.lock') }}-${{ matrix.version }}-${{ matrix.arch }}
+  docker_binary_release:
+    needs: ["binary", "semver"]
+    strategy:
+      matrix:
+        version: [14, 15, 16, 17]
+        platform: ["amd64", "arm64"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ github.event.inputs.tag }} --pattern "vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}_${{ matrix.platform }}.deb" --output pgvecto-rs-binary-release.deb
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./vectors-pg${{ matrix.version }}-${{ needs.setup.outputs.version }}-amd64-unknown-linux-gnu.deb
-          asset_name: vectors-pg${{ matrix.version }}-${{ needs.setup.outputs.version }}-amd64-unknown-linux-gnu.deb
-          asset_content_type: application/vnd.debian.binary-package
+          username: ${{ secrets.DOCKERIO_USERNAME }}
+          password: ${{ secrets.DOCKERIO_TOKEN }}
+      - name: Push binary release to Docker Registry
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          platforms: "linux/${{ matrix.platform }}"
+          file: ./docker/binary_release.Dockerfile
+          tags: tensorchord/pgvecto-rs-binary:pg${{ matrix.version }}-v${{ github.event.inputs.version }}-${{ matrix.platform }}
+  docker_release:
+    needs: ["docker_binary_release", "semver"]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [14, 15, 16, 17]
+        rootless: [true, false]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Variables
+        id: variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if ("${{ matrix.rootless }}" == "true") {
+              core.setOutput('tags', "tensorchord/pgvecto-rs:pg${{ matrix.version }}-v${{ github.event.inputs.version }}-rootless");
+            } else {
+              core.setOutput('tags', "tensorchord/pgvecto-rs:pg${{ matrix.version }}-v${{ github.event.inputs.version }}");
+            }
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERIO_USERNAME }}
+          password: ${{ secrets.DOCKERIO_TOKEN }}
+      - name: Push postgres with pgvecto.rs to Docker Registry(rootful)
+        if: matrix.rootless == false
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          platforms: "linux/amd64,linux/arm64"
+          file: ./docker/pgvecto-rs.Dockerfile
+          build-args: |
+            FROM_TAG=pg${{ matrix.version }}-v${{ github.event.inputs.version }}
+            POSTGRES_VERSION=${{ matrix.version }}
+          tags: ${{ steps.variables.outputs.tags }}
+      - name: Push postgres with pgvecto.rs to Docker Registry(rootless)
+        if: matrix.rootless == true
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          platforms: "linux/amd64,linux/arm64"
+          file: ./docker/pgvecto-rs-rootless.Dockerfile
+          build-args: |
+            FROM_TAG=pg${{ matrix.version }}-v${{ github.event.inputs.version }}
+            POSTGRES_VERSION=${{ matrix.version }}
+          tags: ${{ steps.variables.outputs.tags }}

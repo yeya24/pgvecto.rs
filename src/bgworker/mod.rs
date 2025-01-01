@@ -1,105 +1,82 @@
-mod index;
-mod session;
-mod wal;
+pub mod normal;
 
-pub use session::Client;
-pub use session::ClientBuild;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use self::index::Load;
-use crate::postgres::PORT;
-use crate::prelude::*;
-use dashmap::DashMap;
-use index::Index;
-use std::fs::OpenOptions;
-use std::mem::MaybeUninit;
-use tokio::sync::RwLock;
+static STARTED: AtomicBool = AtomicBool::new(false);
 
-struct Global {
-    indexes: DashMap<Id, &'static RwLock<Load<Index>>>,
-}
-
-static mut GLOBAL: MaybeUninit<Global> = MaybeUninit::uninit();
-
-#[no_mangle]
-extern "C" fn vectors_main(_arg: pgrx::pg_sys::Datum) -> ! {
-    match std::panic::catch_unwind(|| {
-        std::fs::create_dir_all("pg_vectors").expect("Failed to create the directory.");
-        std::env::set_current_dir("pg_vectors").expect("Failed to set the current variable.");
-        unsafe {
-            let global = Global {
-                indexes: DashMap::new(),
-            };
-            (GLOBAL.as_ptr() as *mut Global).write(global);
-        }
-        let logging = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("_log")
-            .expect("The logging file is failed to open.");
-        env_logger::builder()
-            .target(env_logger::Target::Pipe(Box::new(logging)))
-            .init();
-        std::panic::set_hook(Box::new(|info| {
-            let backtrace = std::backtrace::Backtrace::capture();
-            log::error!("Process panickied. {:?}. Backtrace. {}.", info, backtrace);
-        }));
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("The tokio runtime is failed to build.");
-        let listener = runtime
-            .block_on(async { tokio::net::TcpListener::bind(("0.0.0.0", PORT.get() as u16)).await })
-            .expect("The listening port is failed to bind.");
-        runtime.spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::task::spawn(async move {
-                    if let Err(e) = session::server_main(stream).await {
-                        log::error!("Session panickied. {}. {}", e, e.backtrace());
-                    }
-                });
-            }
-        });
-        loop {
-            let mut sig: i32 = 0;
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGHUP);
-                libc::sigaddset(&mut set, libc::SIGTERM);
-                libc::sigwait(&set, &mut sig);
-            }
-            match sig {
-                libc::SIGHUP => {
-                    std::process::exit(0);
-                }
-                libc::SIGTERM => {
-                    std::process::exit(0);
-                }
-                _ => (),
-            }
-            std::thread::yield_now();
-        }
-    }) {
-        Ok(never) => never,
-        Err(_) => {
-            log::error!("The background process crashed.");
-            pgrx::PANIC!("The background process crashed.");
-        }
+pub unsafe fn init() {
+    use service::Version;
+    let path = std::path::Path::new("pg_vectors");
+    if !path.try_exists().unwrap() || Version::read(path.join("VERSION")).is_ok() {
+        use pgrx::bgworkers::BackgroundWorkerBuilder;
+        use pgrx::bgworkers::BgWorkerStartTime;
+        use std::time::Duration;
+        BackgroundWorkerBuilder::new("vectors")
+            .set_library("vectors")
+            .set_function("_vectors_main")
+            .set_argument(None)
+            .enable_shmem_access(None)
+            .set_start_time(BgWorkerStartTime::PostmasterStart)
+            .set_restart_time(Some(Duration::from_secs(15)))
+            .load();
+        STARTED.store(true, Ordering::Relaxed);
     }
 }
 
-fn global() -> &'static Global {
-    unsafe { GLOBAL.assume_init_ref() }
+pub fn is_started() -> bool {
+    STARTED.load(Ordering::Relaxed)
 }
 
-async fn find_index(id: Id) -> anyhow::Result<&'static RwLock<Load<Index>>> {
-    use dashmap::mapref::entry::Entry;
-    match global().indexes.try_entry(id).unwrap() {
-        Entry::Occupied(x) => Ok(x.get()),
-        Entry::Vacant(x) => {
-            let reference = Box::leak(Box::new(RwLock::new(Load::new())));
-            x.insert(reference);
-            Ok(reference)
-        }
+#[pgrx::pg_guard]
+#[no_mangle]
+extern "C" fn _vectors_main(_arg: pgrx::pg_sys::Datum) {
+    // for debugging, set `RUST_LOG=trace`
+    crate::logger::Logger::new(
+        match std::env::var("RUST_LOG").as_ref().map(|x| x.as_str()) {
+            Ok("off" | "Off" | "OFF") => log::LevelFilter::Off,
+            Ok("error" | "Error" | "ERROR") => log::LevelFilter::Error,
+            Ok("warn" | "Warn" | "WARN") => log::LevelFilter::Warn,
+            Ok("info" | "Info" | "INFO") => log::LevelFilter::Info,
+            Ok("debug" | "Debug" | "DEBUG") => log::LevelFilter::Debug,
+            Ok("trace" | "Trace" | "TRACE") => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Info, // default level
+        },
+    )
+    .init()
+    .expect("failed to set logger");
+    std::panic::set_hook(Box::new(|info| {
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            format!("Message: {}", s)
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            format!("Message: {}", s)
+        } else {
+            String::new()
+        };
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "Location: {}:{}:{}.",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_default();
+        // for debugging, set `RUST_BACKTRACE=1`
+        let backtrace = format!("Backtrace: {}", std::backtrace::Backtrace::capture());
+        log::error!("Panickied. {message}; {location}; {backtrace}");
+    }));
+    use service::Version;
+    use service::Worker;
+    use std::path::Path;
+    let path = Path::new("pg_vectors");
+    if path.try_exists().unwrap() {
+        let worker = Worker::open(path.to_owned());
+        normal::normal(worker);
+    } else {
+        let worker = Worker::create(path.to_owned());
+        Version::write(path.join("VERSION"));
+        normal::normal(worker);
     }
 }

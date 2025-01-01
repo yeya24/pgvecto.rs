@@ -1,60 +1,60 @@
 //! Postgres vector extension.
 //!
 //! Provides an easy-to-use extension for vector similarity search.
-#![feature(core_intrinsics)]
-#![feature(allocator_api)]
-#![feature(thread_local)]
-#![feature(auto_traits)]
-#![feature(negative_impls)]
-#![feature(ptr_metadata)]
-#![feature(new_uninit)]
-#![feature(maybe_uninit_slice)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
 
-mod algorithms;
 mod bgworker;
+mod datatype;
 mod embedding;
-mod memory;
-mod postgres;
-mod prelude;
-mod udf;
+mod error;
+mod gucs;
+mod index;
+mod ipc;
+mod logger;
+mod upgrade;
 mod utils;
 
 pgrx::pg_module_magic!();
-
 pgrx::extension_sql_file!("./sql/bootstrap.sql", bootstrap);
 pgrx::extension_sql_file!("./sql/finalize.sql", finalize);
 
-#[allow(non_snake_case)]
 #[pgrx::pg_guard]
-pub unsafe extern "C" fn _PG_init() {
-    use pgrx::bgworkers::BackgroundWorkerBuilder;
-    use pgrx::bgworkers::BgWorkerStartTime;
-    #[cfg(debug_assertions)]
-    {
-        std::env::set_var("RUST_LIB_BACKTRACE", "1");
-        std::env::set_var("RUST_BACKTRACE", "1");
+unsafe extern "C" fn _PG_init() {
+    use crate::error::*;
+    if unsafe { pgrx::pg_sys::IsUnderPostmaster } {
+        bad_init();
     }
-    BackgroundWorkerBuilder::new("vectors")
-        .set_function("vectors_main")
-        .set_library("vectors")
-        .set_argument(None)
-        .set_start_time(BgWorkerStartTime::ConsistentState)
-        .enable_spi_access()
-        .enable_shmem_access(None)
-        .load();
-    self::postgres::init();
-}
-
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
-#[cfg(test)]
-pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
-
-    pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
-        vec![]
+    unsafe {
+        detect::init();
+        gucs::init();
+        index::init();
+        ipc::init();
+        bgworker::init();
     }
 }
+
+#[cfg(not(all(target_endian = "little", target_pointer_width = "64")))]
+compile_error!("Target architecture is not supported.");
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+const SCHEMA: &str = include_str!("../.schema");
+
+const SCHEMA_C_BYTES: [u8; SCHEMA.len() + 1] = {
+    let mut bytes = [0u8; SCHEMA.len() + 1];
+    let mut i = 0_usize;
+    while i < SCHEMA.len() {
+        bytes[i] = SCHEMA.as_bytes()[i];
+        i += 1;
+    }
+    bytes
+};
+
+const SCHEMA_C_STR: &std::ffi::CStr = match std::ffi::CStr::from_bytes_with_nul(&SCHEMA_C_BYTES) {
+    Ok(x) => x,
+    Err(_) => panic!("there are null characters in schema"),
+};
